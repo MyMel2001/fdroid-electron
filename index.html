@@ -1,0 +1,329 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>F-Droid Web Client (Electron)</title>
+    <style>
+        body { font-family: sans-serif; background: #f8f8f8; margin: 0; padding: 0; }
+        header { background: #1976d2; color: white; padding: 1rem; text-align: center; }
+        main { padding: 1rem; max-width: 1000px; margin: auto; }
+        .controls { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem; align-items: center; }
+        input[type=text], select { flex: 1; padding: 0.5rem; border: 1px solid #ccc; border-radius: 5px; }
+        button { padding: 0.5rem 1rem; border: none; border-radius: 5px; background: #1976d2; color: white; cursor: pointer; }
+        button:hover { background: #125aa0; }
+        .app-card { background: white; border-radius: 10px; padding: 1rem; margin-bottom: 1rem; box-shadow: 0 2px 5px rgba(0,0,0,0.1); display: flex; gap: 1rem; }
+        .app-card img { width: 64px; height: 64px; border-radius: 10px; object-fit: contain; }
+        .app-details { flex: 1; }
+        .app-title { font-size: 1.2rem; font-weight: bold; margin-bottom: 0.25rem; }
+        .status { font-size: 0.9rem; margin-top: 0.5rem; }
+        .settings { margin: 1rem 0; padding: 1rem; background: #fff; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .repo-list { margin-top: 0.5rem; font-size: 0.9rem; }
+        .repo-item { display: flex; justify-content: space-between; align-items: center; margin-top: 0.25rem; }
+        textarea { width: 100%; height: 100px; margin-top: 0.5rem; }
+    </style>
+    <script>
+        const { ipcRenderer } = require('electron');
+        const proxyUrl = 'https://corsproxy.io/?url=';
+
+        // State variables
+        let apps = [];
+        let repos = [];
+
+        // DOM elements
+        let deviceSelect;
+        let searchInput;
+        let appsContainer;
+        let globalStatus;
+        let repoListContainer;
+        let newRepoInput;
+        let repoExportTextarea;
+
+        // Helper function for status messages
+        function showStatus(msg, success) {
+            if (globalStatus) {
+                globalStatus.textContent = msg;
+                globalStatus.style.color = success ? "green" : "red";
+            }
+        }
+
+        // Load and save repositories to localStorage
+        function loadReposFromStorage() {
+            const saved = localStorage.getItem("repos");
+            repos = saved ? JSON.parse(saved) : ["https://cloudflare.f-droid.org/repo/"];
+        }
+
+        function saveReposToStorage() {
+            localStorage.setItem("repos", JSON.stringify(repos));
+        }
+
+        async function connectUSB() {
+            ipcRenderer.send('connect-adb');
+        }
+
+        // App and Repo management
+        async function loadRepos() {
+            if (appsContainer) {
+                 appsContainer.innerHTML = "<h3>Loading repos...</h3>";
+            }
+            apps = [];
+            for (const repo of repos) {
+                try {
+                    const res = await fetch(proxyUrl + (repo.endsWith('/') ? `${repo}index-v2.json` : `${repo}/index-v2.json`));
+                    if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                    const data = await res.json();
+                    for (const pkg of Object.values(data.packages)) {
+                        pkg.repoUrl = repo.endsWith('/') ? repo : `${repo}/`;
+                        apps.push(pkg);
+                    }
+                } catch (e) {
+                    console.error("Failed to fetch repo:", repo, e);
+                    showStatus(`Failed to fetch repo: ${repo}`, false);
+                }
+            }
+            renderApps(apps);
+            renderRepoList();
+        }
+
+        function renderApps(appList) {
+            if (!appsContainer) return;
+            appsContainer.innerHTML = "";
+            if (appList.length === 0) {
+                appsContainer.innerHTML = "<p>No apps found.</p>";
+                return;
+            }
+
+            const sorted = [...appList].sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
+
+            const recent = sorted.slice(0, 10);
+            if (recent.length > 0) {
+                const header = document.createElement("h3");
+                header.textContent = "Recently Updated";
+                appsContainer.appendChild(header);
+                recent.forEach(pkg => appendAppCard(appsContainer, pkg));
+            }
+
+            const rest = sorted.slice(10);
+            if (rest.length > 0) {
+                const header = document.createElement("h3");
+                header.textContent = "All Apps";
+                appsContainer.appendChild(header);
+                rest.forEach(pkg => appendAppCard(appsContainer, pkg));
+            }
+        }
+
+        function appendAppCard(container, pkg) {
+            const latestKey = Object.keys(pkg.versions).sort().pop();
+            if (!latestKey) return;
+            const latestVersion = pkg.versions[latestKey];
+            const metadata = pkg.metadata;
+            const div = document.createElement("div");
+            div.className = "app-card";
+            const iconUrl = metadata.icon && metadata.icon['en-US'] ? `${pkg.repoUrl}${metadata.icon['en-US'].name}` : "";
+            const appTitle = metadata.name && metadata.name['en-US'] ? metadata.name['en-US'] : pkg.packageName;
+            const appSummary = metadata.summary && metadata.summary['en-US'] ? metadata.summary['en-US'] : "No description available.";
+
+            div.innerHTML = `
+                ${iconUrl ? `<img src="${iconUrl}" alt="icon">` : `<div style="width:64px;height:64px;background:#ccc;border-radius:10px;"></div>`}
+                <div class="app-details">
+                    <div class="app-title">${appTitle}</div>
+                    <div>${appSummary}</div>
+                    <button class="install-btn" data-pkg-name="${pkg.packageName}" data-apk-name="${latestVersion.file.name}" data-repo-url="${pkg.repoUrl}">Install</button>
+                    <div class="status" id="status-${pkg.packageName}"></div>
+                </div>
+            `;
+            container.appendChild(div);
+        }
+
+        async function installApp(pkgName, apkFile, repoUrl, statusEl) {
+            statusEl.textContent = "Downloading...";
+            statusEl.style.color = "black";
+            try {
+                const url = `${proxyUrl}${repoUrl}/${apkFile}`;
+                const res = await fetch(url);
+                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                const blob = await res.blob();
+                
+                statusEl.textContent = "Installing...";
+                const apkData = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                });
+
+                ipcRenderer.send('install-apk', { apkData });
+
+                ipcRenderer.once('installation-status', (event, { success, message }) => {
+                    if (success) {
+                        statusEl.textContent = "✅ Installed!";
+                        statusEl.style.color = "green";
+                        console.log("Installation successful:", message);
+                    } else {
+                        statusEl.textContent = "❌ Installation failed: " + message.substring(0, 50) + "...";
+                        statusEl.style.color = "red";
+                        console.error("Installation failed:", message);
+                    }
+                });
+
+            } catch (e) {
+                console.error(e);
+                statusEl.textContent = "❌ Installation failed due to a network error.";
+                statusEl.style.color = "red";
+            }
+        }
+
+        function searchApps() {
+            const q = searchInput.value.toLowerCase();
+            const filtered = apps.filter(pkg => {
+                if (pkg.metadata) {
+                    const appTitle = (pkg.metadata.name && pkg.metadata.name['en-US'] ? pkg.metadata.name['en-US'] : pkg.packageName).toLowerCase();
+                    const appSummary = (pkg.metadata.summary && pkg.metadata.summary['en-US'] ? pkg.metadata.summary['en-US'] : "").toLowerCase();
+                    return appTitle.includes(q) || appSummary.includes(q);
+                } else {
+                    const latestKey = Object.keys(pkg.versions).sort().pop();
+                    if (!latestKey) return false;
+                    const app = pkg.versions[latestKey];
+                    const localizedData = app.localized && app.localized.en ? app.localized.en : {};
+                    const appTitle = (localizedData.appName || "").toLowerCase();
+                    const appSummary = (localizedData.summary || "").toLowerCase();
+                    return appTitle.includes(q) || appSummary.includes(q);
+                }
+            });
+            renderApps(filtered);
+        }
+
+        function renderRepoList() {
+            if (!repoListContainer) return;
+            repoListContainer.innerHTML = "";
+            repos.forEach((repo, index) => {
+                const item = document.createElement("div");
+                item.className = "repo-item";
+                item.innerHTML = `
+                    <span>${repo}</span>
+                    <button class="remove-btn" data-index="${index}">Remove</button>
+                `;
+                repoListContainer.appendChild(item);
+            });
+        }
+
+        function addRepo() {
+            const url = newRepoInput.value;
+            if (url && !repos.includes(url)) {
+                repos.push(url);
+                saveReposToStorage();
+                newRepoInput.value = "";
+                loadRepos();
+            }
+        }
+
+        function removeRepo(index) {
+            repos.splice(index, 1);
+            saveReposToStorage();
+            loadRepos();
+        }
+
+        function exportRepos() {
+            repoExportTextarea.value = JSON.stringify(repos, null, 2);
+        }
+
+        function importRepos() {
+            try {
+                const imported = JSON.parse(repoExportTextarea.value);
+                if (Array.isArray(imported)) {
+                    repos = imported;
+                    saveReposToStorage();
+                    loadRepos();
+                    showStatus("Repositories imported successfully!", true);
+                } else {
+                    showStatus("Invalid repo list JSON.", false);
+                }
+            } catch (e) {
+                showStatus("Invalid repo list JSON.", false);
+                console.error("Import failed:", e);
+            }
+        }
+
+        // Event Listeners
+        window.addEventListener("DOMContentLoaded", () => {
+            // Assign DOM elements inside this event listener to ensure they exist
+            deviceSelect = document.getElementById("device-select");
+            searchInput = document.getElementById("search");
+            appsContainer = document.getElementById("apps");
+            globalStatus = document.getElementById("global-status");
+            repoListContainer = document.getElementById("repo-list");
+            newRepoInput = document.getElementById("new-repo");
+            repoExportTextarea = document.getElementById("repo-export");
+
+            loadReposFromStorage();
+            loadRepos();
+
+            document.getElementById("connect-usb-btn").addEventListener("click", connectUSB);
+            document.getElementById("add-repo-btn").addEventListener("click", addRepo);
+            document.getElementById("export-repos-btn").addEventListener("click", exportRepos);
+            document.getElementById("import-repos-btn").addEventListener("click", importRepos);
+
+            searchInput.addEventListener("input", searchApps);
+
+            repoListContainer.addEventListener("click", e => {
+                if (e.target.classList.contains("remove-btn")) {
+                    const index = e.target.dataset.index;
+                    removeRepo(index);
+                }
+            });
+
+            appsContainer.addEventListener("click", e => {
+                if (e.target.classList.contains("install-btn")) {
+                    const { pkgName, apkName, repoUrl } = e.target.dataset;
+                    const appCard = e.target.closest('.app-card');
+                    const statusEl = appCard.querySelector('.status');
+                    installApp(pkgName, apkName, repoUrl, statusEl);
+                }
+            });
+        });
+
+        // IPC Listeners for communication with the main process
+        ipcRenderer.on('devices-found', (event, devices) => {
+            if (deviceSelect) {
+                if (devices.length > 0) {
+                    const serial = devices[0].serial;
+                    deviceSelect.innerHTML = `<option value="${serial}">${serial} (connected)</option>`;
+                    deviceSelect.value = serial;
+                    showStatus("Connected via ADB!", true);
+                } else {
+                    showStatus("No ADB devices found.", false);
+                }
+            }
+        });
+
+        ipcRenderer.on('connection-error', (event, message) => {
+            showStatus(`Failed to connect: ${message}`, false);
+        });
+    </script>
+</head>
+<body>
+    <header>
+        <h1>F-Droid Web Client (Electron)</h1>
+    </header>
+    <main>
+        <div class="controls">
+            <button id="connect-usb-btn">Connect via USB</button>
+            <select id="device-select" disabled></select>
+            <input type="text" id="search" placeholder="Search apps...">
+        </div>
+        <div id="global-status" style="margin-bottom:1rem;"></div>
+        <div class="settings">
+            <h3>Third-Party Repos</h3>
+            <input type="text" id="new-repo" placeholder="https://example.com/repo/">
+            <button id="add-repo-btn">Add Repo</button>
+            <div id="repo-list" class="repo-list"></div>
+            <h4>Export / Import Repo List</h4>
+            <textarea id="repo-export" placeholder="Click Export to copy repos or paste repos JSON here"></textarea>
+            <div style="margin-top:0.5rem;">
+                <button id="export-repos-btn">Export</button>
+                <button id="import-repos-btn">Import</button>
+            </div>
+        </div>
+        <div id="apps"></div>
+    </main>
+</body>
+</html>
