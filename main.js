@@ -15,6 +15,7 @@ function createWindow() {
       contextIsolation: false
     },
     autoHideMenuBar: true,
+    title: 'F-Droid Electron',
   });
 
   win.loadFile('index.html');

@@ -1,5 +1,5 @@
 {
-  "name": "f-droid-web-client",
+  "name": "fdroid-electron",
   "version": "1.0.0",
   "main": "main.js",
   "scripts": {
